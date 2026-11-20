@@ -6,6 +6,8 @@
   <meta name="theme-color" content="#17251f">
   <meta name="description" content="Nghiên cứu tương tác chạm và âm thanh tiếng Việt, giúp người khiếm thị khám phá vị trí và màu sắc trong tác phẩm hội họa.">
   <title>Họa Thanh Chạm — Chạm để nghe tranh kể</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
   <style>
     :root {
       color-scheme: light;
@@ -152,7 +154,7 @@
     .demo-section h2 em { color: var(--lime); font-weight: 400; }
     .demo-layout { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(280px, .7fr); gap: 32px; align-items: stretch; }
     .canvas-frame { position: relative; overflow: hidden; border: 1px solid #ffffff2b; background: #263a31; }
-    canvas { display: block; width: 100%; aspect-ratio: 3 / 2; cursor: crosshair; touch-action: none; }
+    canvas { display: block; width: 100%; height: auto; max-height: 68vh; cursor: crosshair; touch-action: none; }
     .canvas-hint {
       position: absolute;
       right: 12px;
@@ -298,12 +300,14 @@
             <span class="panel-kicker">Bạn đang khám phá</span>
             <h3 class="panel-title" id="location">Chính giữa bức tranh</h3>
             <p class="demo-description" id="description">Chạm vào một vùng màu để nghe mô tả vị trí và sắc thái. Bạn có thể khám phá theo nhịp độ của riêng mình.</p>
+            <p class="demo-footnote" id="object-reading">Vật thể: đang chờ nhận diện</p>
             <div class="color-reading" aria-live="polite">
               <span class="color-chip" id="color-chip" aria-hidden="true"></span>
               <span><span class="color-name" id="color-name">Sẵn sàng lắng nghe</span><span class="color-detail" id="color-detail">Chạm vào tranh để bắt đầu</span></span>
             </div>
             <div class="demo-controls">
               <button class="button" id="speak-button" type="button">▶&nbsp; Nghe mô tả</button>
+              <button class="button secondary" id="reset-button" type="button">↺&nbsp; Dùng ảnh mẫu</button>
               <label class="upload-label">
                 <span class="button secondary">＋&nbsp; Tải ảnh của bạn lên</span>
                 <input id="image-upload" type="file" accept="image/*" aria-label="Tải ảnh tác phẩm lên để khám phá">
@@ -463,9 +467,75 @@
       const colorChip = document.getElementById("color-chip");
       const announcement = document.getElementById("live-announcement");
       const upload = document.getElementById("image-upload");
+      const objectReading = document.getElementById("object-reading");
       let lastReading = null;
       let lastSpokenAt = 0;
       let pointerDown = false;
+      let objectModel = null;
+      let detections = [];
+
+      const vietnameseObjectNames = {
+        person: "người", bicycle: "xe đạp", car: "xe hơi", motorcycle: "xe máy",
+        airplane: "máy bay", bus: "xe buýt", train: "tàu hỏa", truck: "xe tải",
+        boat: "thuyền", bird: "chim", cat: "mèo", dog: "chó", horse: "ngựa",
+        sheep: "con cừu", cow: "con bò", elephant: "con voi", bear: "con gấu",
+        zebra: "ngựa vằn", giraffe: "hươu cao cổ", backpack: "ba lô",
+        umbrella: "ô dù", handbag: "túi xách", tie: "caravat", suitcase: "vali",
+        frisbee: "đĩa bay", skis: "ván trượt tuyết", snowboard: "ván trượt tuyết",
+        sports: "dụng cụ thể thao", kite: "diều", baseball: "bóng chày",
+        bat: "gậy bóng chày", glove: "găng tay", skateboard: "ván trượt",
+        surfboard: "ván lướt sóng", tennis: "vợt tenis", bottle: "chai",
+        wine: "ly rượu", cup: "cốc", fork: "nĩa", knife: "dao",
+        spoon: "thìa", bowl: "bát", banana: "chuối", apple: "táo",
+        sandwich: "bánh sandwich", orange: "quả cam", broccoli: "bông cải",
+        carrot: "cà rốt", hot: "hot dog", pizza: "bánh pizza", donut: "bánh donut",
+        cake: "bánh ngọt", chair: "ghế", couch: "ghế sofa", potted: "chậu cây",
+        bed: "giường", dining: "bàn ăn", toilet: "bồn cầu", tv: "ti vi",
+        laptop: "máy tính xách tay", mouse: "chuột máy tính", remote: "điều khiển",
+        keyboard: "bàn phím", phone: "điện thoại", microwave: "lò vi sóng",
+        oven: "lò nướng", toaster: "máy nướng bánh mì", sink: "chậu rửa",
+        refrigerator: "tủ lạnh", book: "sách", clock: "đồng hồ", vase: "bình hoa",
+        scissors: "kéo", teddy: "gấu bông", hair: "máy sấy tóc", toothbrush: "bàn chải"
+      };
+
+      function getVietnameseObjectName(className) {
+        if (vietnameseObjectNames[className]) return vietnameseObjectNames[className];
+        if (className.includes("baseball")) return "bóng chày";
+        if (className.includes("traffic")) return "biển báo giao thông";
+        if (className.includes("hot")) return "hot dog";
+        return className;
+      }
+
+      async function loadObjectModel() {
+        if (!window.cocoSsd) {
+          objectReading.textContent = "Vật thể: trình duyệt chưa tải được mô hình nhận diện.";
+          return;
+        }
+        objectReading.textContent = "Vật thể: đang tải mô hình nhận diện...";
+        try {
+          objectModel = await window.cocoSsd.load({ base: "lite_mobilenet_v2" });
+          await detectObjects();
+        } catch (error) {
+          objectReading.textContent = "Vật thể: không thể tải mô hình nhận diện.";
+        }
+      }
+
+      async function detectObjects() {
+        if (!objectModel) return;
+        objectReading.textContent = "Vật thể: đang nhận diện...";
+        try {
+          detections = await objectModel.detect(canvas, 10, 0.55);
+          if (detections.length) {
+            const names = [...new Set(detections.map(item => getVietnameseObjectName(item.class)))];
+            objectReading.textContent = `Vật thể phát hiện: ${names.join(", ")}`;
+          } else {
+            objectReading.textContent = "Vật thể: chưa nhận diện được vật thể rõ ràng";
+          }
+        } catch (error) {
+          detections = [];
+          objectReading.textContent = "Vật thể: không thể nhận diện ảnh này";
+        }
+      }
 
       function drawSample() {
         const w = canvas.width;
@@ -545,6 +615,41 @@
         return "nâu";
       }
 
+      function getObjectAt(px, py) {
+        if (!detections.length) return null;
+        const containing = detections.find(item => {
+          const [left, top, width, height] = item.bbox;
+          return px >= left && px <= left + width && py >= top && py <= top + height;
+        });
+        if (containing) return {
+          name: getVietnameseObjectName(containing.class),
+          confidence: containing.score
+        };
+
+        let nearest = null;
+        let nearestDistance = Infinity;
+        for (const item of detections) {
+          const [left, top, width, height] = item.bbox;
+          const centerX = left + width / 2;
+          const centerY = top + height / 2;
+          const dx = px - centerX;
+          const dy = py - centerY;
+          const distance = Math.sqrt(dx * dx + dy * dy) / Math.max(canvas.width, canvas.height);
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = item;
+          }
+        }
+        if (nearest && nearestDistance < .28) {
+          return {
+            name: getVietnameseObjectName(nearest.class),
+            confidence: nearest.score,
+            nearby: true
+          };
+        }
+        return null;
+      }
+
       function readAt(clientX, clientY, shouldSpeak) {
         const rect = canvas.getBoundingClientRect();
         const x = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
@@ -564,10 +669,15 @@
         const brightness = (red * .299 + green * .587 + blue * .114) / 255;
         const shade = brightness < .28 ? "rất tối" : brightness < .48 ? "tối" : brightness < .72 ? "trung bình" : brightness < .88 ? "sáng" : "sáng nhạt";
         const warmth = red > blue * 1.16 && red > green * .92 ? "gam ấm" : blue > red * 1.18 ? "gam lạnh" : "gam trung tính";
-        const sentence = `${position}. Vùng màu ${color}, sắc độ ${shade}, thuộc ${warmth}.`;
+        const objectAtPoint = getObjectAt(px, py);
+        const objectText = objectAtPoint
+          ? `${objectAtPoint.nearby ? "Gần " : "Trong "}vùng ${objectAtPoint.name}, độ tin cậy ${Math.round(objectAtPoint.confidence * 100)} phần trăm.`
+          : "Không nhận diện được vật thể nổi bật tại điểm này.";
+        const sentence = `${position}. ${objectText} Vùng màu ${color}, sắc độ ${shade}, thuộc ${warmth}.`;
 
         locationLabel.textContent = position;
-        description.textContent = `Vùng màu ${color}, sắc độ ${shade}, thuộc ${warmth}.`;
+        description.textContent = `${objectText} Vùng màu ${color}, sắc độ ${shade}, thuộc ${warmth}.`;
+        objectReading.textContent = `Vật thể: ${objectAtPoint ? objectAtPoint.name : "không nhận diện rõ tại điểm này"}`;
         colorName.textContent = color.charAt(0).toLocaleUpperCase("vi") + color.slice(1);
         colorDetail.textContent = `${shade} · ${warmth}`;
         colorChip.style.backgroundColor = `rgb(${red}, ${green}, ${blue})`;
@@ -620,6 +730,17 @@
       document.getElementById("speak-button").addEventListener("click", () => {
         speak(lastReading || "Chạm hoặc rê trên bức tranh để nghe mô tả vị trí và màu sắc.");
       });
+      document.getElementById("reset-button").addEventListener("click", () => {
+        canvas.width = 900;
+        canvas.height = 600;
+        canvas.setAttribute("aria-label", "Tranh phong cảnh mẫu. Chạm hoặc rê ngón tay để nghe vị trí và màu sắc.");
+        drawSample();
+        detections = [];
+        upload.value = "";
+        lastReading = null;
+        description.textContent = "Đã khôi phục tranh mẫu. Chạm hoặc rê để khám phá.";
+        detectObjects();
+      });
       upload.addEventListener("change", event => {
         const file = event.target.files && event.target.files[0];
         if (!file) return;
@@ -630,16 +751,19 @@
         }
         const image = new Image();
         image.onload = () => {
-          const scale = Math.max(canvas.width / image.width, canvas.height / image.height);
-          const width = image.width * scale;
-          const height = image.height * scale;
+          const scale = Math.min(1200 / image.width, 900 / image.height, 1);
+          canvas.width = Math.max(1, Math.round(image.width * scale));
+          canvas.height = Math.max(1, Math.round(image.height * scale));
           ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(image, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+          ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
           URL.revokeObjectURL(image.src);
+          canvas.setAttribute("aria-label", `Ảnh tải lên kích thước ${image.width} x ${image.height} điểm ảnh. Chạm hoặc rê để nghe vật thể, vị trí và màu sắc.`);
           description.textContent = "Đã tải ảnh. Chạm hoặc rê trên tranh để nghe mô tả vị trí và màu sắc.";
           colorName.textContent = "Ảnh đã sẵn sàng";
           colorDetail.textContent = "Chạm vào tranh để khám phá";
           lastReading = null;
+          detections = [];
+          detectObjects();
         };
         image.onerror = () => {
           description.textContent = "Không thể mở ảnh này. Vui lòng thử chọn một ảnh khác.";
@@ -649,6 +773,7 @@
       });
 
       drawSample();
+      loadObjectModel();
     })();
   </script>
 </body>
